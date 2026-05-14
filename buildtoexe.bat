@@ -1,1 +1,1 @@
-uv run --with pyinstaller --with requests pyinstaller -w --onefile --name "MapperOSDBBuilder" --version-file=target_metadata.txt --icon ".\19494789.ico" .\mapper_osdb_gui.py
+uv run --with pyinstaller --with requests pyinstaller -w --onefile --name "MapperOSDBBuilder" --version-file=target_metadata.txt --icon ".\icon.ico" .\mapper_osdb_gui.py

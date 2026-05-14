@@ -1,0 +1,7 @@
+/build/
+/dist/
+/output/
+/target_metadata/
+target_metadata.txt
+MapperOSDBBuilder.spec
+.gitignore.txt

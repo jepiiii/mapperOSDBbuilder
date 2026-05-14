@@ -10,32 +10,30 @@ Mapper OSDB Builder
 
 A small Tkinter GUI that:
 1. Uses osu!api v2 to fetch beatmapsets for a mapper.
-2. Extracts beatmap IDs from selected categories.
-3. Writes a beatmap_ids.txt file.
-4. Optionally calls Collection Manager CLI to create a .osdb file.
+2. Extracts readable beatmap metadata from selected categories.
+3. Applies ruleset, star difficulty, and AR filters.
+4. Writes a readable .osdb file directly.
 
 Recommended contained run:
-    uv run mapper_osdb_gui.py
+    uv run --script mapper_osdb_gui.py
 
 Optional reproducible lockfile:
     uv lock --script mapper_osdb_gui.py
     uv run --script mapper_osdb_gui.py
 
-Fallback without uv:
-    pip install requests
-    python mapper_osdb_gui.py
+One-file EXE build:
+    uv run --with pyinstaller --with requests pyinstaller --noconsole --onefile --clean --name "MapperOSDBBuilder" mapper_osdb_gui.py
 """
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import io
 import json
 import os
 import queue
 import struct
-import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -62,7 +60,6 @@ RULESETS = {
     "catch": "fruits",
     "mania": "mania",
 }
-
 PLAY_MODE_BYTES = {
     "osu": 0,
     "taiko": 1,
@@ -70,6 +67,13 @@ PLAY_MODE_BYTES = {
     "catch": 2,
     "mania": 3,
 }
+
+
+def app_root() -> Path:
+    """Return the app folder for both source runs and PyInstaller one-file exe builds."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 @dataclass
@@ -87,8 +91,6 @@ class FetchOptions:
     ar_max: float
     output_folder: Path
     collection_name: str
-    cm_cli_path: Path | None
-    osu_location: Path | None
     generate_osdb: bool
 
 
@@ -194,8 +196,16 @@ def safe_collection_filename(name: str) -> str:
 
 
 def beatmap_ruleset(beatmap: dict[str, Any]) -> str | None:
-    # osu!api responses may expose mode differently depending on shape.
     return beatmap.get("mode") or beatmap.get("ruleset")
+
+
+def beatmap_stars(beatmap: dict[str, Any]) -> float:
+    return float(beatmap.get("difficulty_rating") or beatmap.get("stars") or 0.0)
+
+
+def beatmap_ar(beatmap: dict[str, Any]) -> float:
+    value = beatmap.get("ar")
+    return float(value) if value is not None else 0.0
 
 
 def is_owned_by_user(
@@ -203,13 +213,7 @@ def is_owned_by_user(
     user_id: int,
     beatmapset_owner_id: int | None = None,
 ) -> bool:
-    """Return True when the mapper appears to own this difficulty.
-
-    osu!api responses vary a bit depending on endpoint/shape, so this checks:
-    1. beatmap.user_id when present,
-    2. beatmap.owners when present,
-    3. beatmapset owner as a safe fallback for solo/hosted sets with no owners list.
-    """
+    """Return True when the mapper appears to own this difficulty."""
     if beatmap.get("user_id") == user_id:
         return True
 
@@ -224,22 +228,8 @@ def is_owned_by_user(
 
 
 def placeholder_md5_for_map_id(map_id: int) -> str:
-    """Create a stable placeholder hash when osu!api does not expose a checksum.
-
-    Collection Manager uses hashes internally, but downloadable .osdb entries can still carry
-    map ID, mapset ID, title, artist, difficulty, mode, and stars. A stable unique placeholder
-    prevents all API-only maps from collapsing into one blank-hash entry.
-    """
+    """Create a stable placeholder hash when osu!api does not expose a checksum."""
     return hashlib.md5(f"mapper-osdb-builder:{map_id}".encode("utf-8")).hexdigest()
-
-
-def beatmap_stars(beatmap: dict[str, Any]) -> float:
-    return float(beatmap.get("difficulty_rating") or beatmap.get("stars") or 0.0)
-
-
-def beatmap_ar(beatmap: dict[str, Any]) -> float:
-    value = beatmap.get("ar")
-    return float(value) if value is not None else 0.0
 
 
 def make_beatmap_record(beatmapset: dict[str, Any], beatmap: dict[str, Any]) -> BeatmapRecord:
@@ -265,7 +255,7 @@ def make_beatmap_record(beatmapset: dict[str, Any], beatmap: dict[str, Any]) -> 
     )
 
 
-def collect_beatmap_ids(options: FetchOptions, log) -> tuple[dict[str, Any], dict[int, BeatmapRecord], dict[str, int]]:
+def collect_beatmaps(options: FetchOptions, log) -> tuple[dict[str, Any], dict[int, BeatmapRecord], dict[str, int]]:
     api = OsuApi(options.client_id, options.client_secret, log)
     api.authenticate()
 
@@ -297,12 +287,13 @@ def collect_beatmap_ids(options: FetchOptions, log) -> tuple[dict[str, Any], dic
             seen_set_ids.add(dedupe_key)
 
             beatmaps = beatmapset.get("beatmaps") or []
-            if (
+            needs_full_fetch = (
                 not beatmaps
                 or not beatmapset.get("artist")
                 or not beatmapset.get("title")
                 or any("ar" not in b or "difficulty_rating" not in b for b in beatmaps)
-            ):
+            )
+            if needs_full_fetch:
                 full = api.get_beatmapset(set_id)
                 beatmapset = {**beatmapset, **full}
                 beatmaps = full.get("beatmaps") or beatmaps
@@ -315,12 +306,9 @@ def collect_beatmap_ids(options: FetchOptions, log) -> tuple[dict[str, Any], dic
                     continue
 
                 if bm_type == "guest":
-                    # Guest category already means the user contributed, but this check
-                    # helps narrow to the user's own GDs when owners are available.
                     if not is_owned_by_user(beatmap, user_id):
                         continue
                 elif not options.include_all_diffs_in_hosted_sets:
-                    # Hosted mapset, but only include diffs owned by this user.
                     if not is_owned_by_user(beatmap, user_id, set_owner_id):
                         continue
 
@@ -359,7 +347,6 @@ def write_download_urls_file(output_folder: Path, collection_name: str, records:
 
 
 def write_7bit_encoded_int(stream: io.BytesIO, value: int) -> None:
-    # .NET BinaryWriter string length format.
     value &= 0xFFFFFFFF
     while value >= 0x80:
         stream.write(bytes([(value | 0x80) & 0xFF]))
@@ -386,19 +373,13 @@ def write_double(stream: io.BytesIO, value: float) -> None:
 
 
 def current_oadate() -> float:
-    # Same epoch used by .NET DateTime.ToOADate: 1899-12-30.
     epoch = datetime(1899, 12, 30, tzinfo=timezone.utc)
     delta = datetime.now(timezone.utc) - epoch
     return delta.days + (delta.seconds + delta.microseconds / 1_000_000) / 86400
 
 
-def write_api_osdb(output_folder: Path, collection_name: str, records: list[BeatmapRecord]) -> Path:
-    """Write a Collection Manager .osdb directly from osu!api metadata.
-
-    This writes the older uncompressed o!dm6 variant of .osdb. Collection Manager still
-    supports it, and it avoids GZip-archive edge cases while preserving map IDs,
-    mapset IDs, artist/title/difficulty, comments, mode, and star rating.
-    """
+def write_osdb(output_folder: Path, collection_name: str, records: list[BeatmapRecord]) -> Path:
+    """Write a readable Collection Manager-compatible .osdb directly from osu!api metadata."""
     output_folder.mkdir(parents=True, exist_ok=True)
     output_path = output_folder / f"{safe_collection_filename(collection_name)}.osdb"
 
@@ -464,46 +445,16 @@ def write_run_summary(
     return summary_path
 
 
-def run_collection_manager(options: FetchOptions, ids_path: Path, log) -> Path:
-    if not options.cm_cli_path:
-        raise ValueError("Collection Manager CLI path is missing.")
-
-    output_path = options.output_folder / f"{safe_collection_filename(options.collection_name)}.osdb"
-
-    cmd = [
-        str(options.cm_cli_path),
-        "create",
-        "-b",
-        str(ids_path),
-        "-o",
-        str(output_path),
-    ]
-
-    if options.osu_location:
-        cmd.extend(["-l", str(options.osu_location)])
-
-    log("Running Collection Manager CLI...")
-    log(" ".join(f'"{x}"' if " " in x else x for x in cmd))
-
-    process = subprocess.run(cmd, capture_output=True, text=True)
-
-    if process.stdout:
-        log(process.stdout.strip())
-    if process.stderr:
-        log(process.stderr.strip())
-
-    if process.returncode != 0:
-        raise RuntimeError(f"Collection Manager CLI failed with exit code {process.returncode}")
-
-    return output_path
-
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x720")
-        self.minsize(860, 620)
+        icon_path = app_root() / "icon.ico"
+        if icon_path.exists():
+            self.iconbitmap(str(icon_path))
+        
+        self.geometry("1040x860")
+        self.minsize(1040, 860)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -512,9 +463,7 @@ class App(tk.Tk):
         self.client_secret_var = tk.StringVar()
         self.mapper_var = tk.StringVar(value="JayAreEee")
         self.collection_name_var = tk.StringVar(value="JayAreEee - mapper maps")
-        self.output_folder_var = tk.StringVar(value=str(Path.cwd() / "output"))
-        self.cm_cli_var = tk.StringVar()
-        self.osu_location_var = tk.StringVar()
+        self.output_folder_var = tk.StringVar(value=str(app_root() / "output"))
         self.ruleset_var = tk.StringVar(value="All modes")
         self.star_min_var = tk.DoubleVar(value=0.0)
         self.star_max_var = tk.DoubleVar(value=15.0)
@@ -540,7 +489,7 @@ class App(tk.Tk):
 
         subtitle = ttk.Label(
             root,
-            text="Fetch a mapper's beatmaps with osu!api and generate an .osdb through Collection Manager CLI.",
+            text="Fetch mapper beatmaps with osu!api and generate a readable .osdb locally.",
         )
         subtitle.pack(anchor="w", pady=(0, 12))
 
@@ -575,18 +524,17 @@ class App(tk.Tk):
             variable=self.save_secret_var,
         ).grid(row=2, column=1, sticky="w", pady=(0, 12))
 
-        self._path_row(grid, 3, "Collection Manager CLI folder (optional)", self.cm_cli_var, kind="folder")
-        self._path_row(grid, 4, "Output folder", self.output_folder_var, kind="folder")
+        self._path_row(grid, 3, "Output folder", self.output_folder_var, kind="folder")
 
-        for i in range(4):
+        for i in range(3):
             grid.columnconfigure(i, weight=1 if i == 1 else 0)
 
         note = ttk.Label(
             parent,
             wraplength=850,
             text=(
-                "This version writes the .osdb directly from osu!api metadata, so Collection Manager CLI "
-                "is optional. You can still save its folder here for convenience/future export steps."
+                "The app writes .osdb files directly from osu!api metadata. "
+                "The default output folder is an output folder beside the script or exe."
             ),
         )
         note.pack(anchor="w", pady=(16, 0))
@@ -641,9 +589,8 @@ class App(tk.Tk):
             parent,
             wraplength=850,
             text=(
-                        "Recommended default: include ranked/loved/pending/graveyard/guest, include every difficulty in hosted sets, "
-                "and leave star/AR ranges wide open. Use 'only mapper-owned difficulties' when you want something closer "
-                "to osu!alternative's creator filter."
+                "Recommended default: include all categories, All modes, include every difficulty in hosted sets, "
+                "and leave star/AR ranges wide open. Turn off hosted-set difficulties for a stricter creator-only result."
             ),
         )
         explanation.pack(anchor="w", pady=(8, 0))
@@ -677,132 +624,36 @@ class App(tk.Tk):
         text.insert(
             "1.0",
             """
-Tool outline + quick instructions
+Mapper OSDB Builder — quick guide
 =================================
 
-Core job
---------
-Create an .osdb collection containing maps from a specific mapper without relying on Discord upload limits.
+What it does
+------------
+Creates a readable .osdb collection from a mapper using osu!api data.
 
-How to operate it
------------------
-0. Install uv if you do not already have it.
-   - Windows: winget install --id=astral-sh.uv -e
-   - macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh
-
-1. Run the app in a contained uv environment:
-   uv run mapper_osdb_gui.py
-
-2. Optional, for repeatable dependency resolution:
-   uv lock --script mapper_osdb_gui.py
-   uv run --script mapper_osdb_gui.py
-
-3. Open the Setup tab.
-2. Enter your osu! OAuth client ID and client secret.
-3. Optional: select your Collection Manager CLI folder.
-4. Pick an output folder. By default, this is an output folder beside the script.
-8. Open Mapper + Filters.
-9. Enter the mapper username or user ID.
-10. Choose categories, ruleset, scope, star range, and AR range.
-11. Open Run.
-12. Click Preview / Count IDs first.
-13. If the count looks right, click Build .osdb.
-14. Import the created .osdb into Collection Manager.
+Basic steps
+-----------
+1. Setup: enter osu! OAuth client ID and secret.
+2. Choose an output folder, or leave the default output folder beside the script/exe.
+3. Mapper + Filters: enter a mapper username or user ID.
+4. Pick categories, ruleset, scope, star range, and AR range.
+5. Run: click Preview / Count IDs.
+6. If the result looks right, click Build .osdb.
 
 Generated files
 ---------------
-1. <collection>.beatmap_ids.txt
-   - Raw beatmap IDs used to build the collection.
+- <collection>.osdb: main collection file.
+- <collection>.beatmap_ids.txt: raw beatmap IDs.
+- <collection>.download_urls.txt: unique beatmapset links.
+- <collection>.summary.json: run settings and counts.
 
-2. <collection>.download_urls.txt
-   - Unique beatmapset links for manual checking/downloading.
+Recommended defaults
+--------------------
+Use all categories, All modes, include guest sets, include every difficulty in hosted sets, Star 0.0–15.0, and AR 0.0–11.0.
 
-3. <collection>.osdb
-   - API-filled Collection Manager collection file, if Build .osdb succeeds.
-   - This is the main file to import into Collection Manager.
-
-4. <collection>.summary.json
-   - Run metadata: mapper, filters, category counts, and output paths.
-
-Recommended default
--------------------
-Use all five categories, All modes, include guest sets, include every difficulty in hosted mapsets, Star 0.0–15.0, and AR 0.0–11.0. This gives the broadest “all maps from this mapper” style output.
-
-Main inputs
------------
-1. osu! OAuth client ID and client secret
-   - Needed for osu!api v2 public data.
-
-2. Mapper username or user ID
-   - Example: JayAreEee
-   - Username lookup prefixes the username with @ behind the scenes.
-
-3. Beatmapset categories
-   - ranked
-   - loved
-   - pending
-   - graveyard
-   - guest
-
-4. Scope mode
-   - Hosted set mode: include every difficulty inside mapsets hosted by the mapper.
-   - Mapper-owned difficulty mode: include only difficulties whose owners include the mapper.
-
-5. Ruleset filter
-   - All modes
-   - osu!
-   - taiko
-   - catch
-   - mania
-
-6. Range filters
-   - Star difficulty minimum and maximum
-   - Approach Rate minimum and maximum
-
-7. Output folder and collection name
-   - Writes <collection>.beatmap_ids.txt
-   - Optionally writes <collection>.osdb
-
-7. Collection Manager CLI folder
-   - Optional.
-   - The script now writes an API-filled .osdb directly to avoid ID-only placeholder entries.
-   - The folder path is saved for convenience/future export steps.
-
-8. osu!.db / client.realm path
-   - No longer required by the main builder.
-
-Actions
--------
-1. Preview / Count IDs
-   - Fetches the mapper's mapsets.
-   - Deduplicates beatmap IDs.
-   - Writes a beatmap_ids.txt file.
-   - Does not create an .osdb.
-
-2. Build .osdb
-   - Does everything above.
-   - Writes an API-filled .osdb directly.
-
-3. Save Settings
-   - Saves non-secret settings by default.
-   - Can save the client secret only if the checkbox is enabled.
-
-What this tool deliberately does not do yet
-------------------------------------------
-1. It does not download .osz files directly.
-2. It does not automate osu!alternative Discord commands.
-3. It does not merge multiple .osdb files yet.
-
-uv notes
---------
-The script contains inline dependency metadata at the top. uv reads that metadata, creates/uses an isolated environment, installs requests there, and then runs the GUI. This means you do not need to install requests globally.
-
-Good next features
+Packaged EXE build
 ------------------
-1. Add chunking: split giant mappers into several .osdb files by status or star range.
-2. Add a local cache so repeated runs do not re-fetch everything.
-3. Add a direct .osz download queue if you want a full map pack builder.
-4. Add presets for “hosted sets only”, “GD only”, and “osu!alternative-like creator mode”.
+uv run --with pyinstaller --with requests pyinstaller --noconsole --onefile --clean --name "MapperOSDBBuilder" mapper_osdb_gui.py
 """.strip(),
         )
         text.configure(state="disabled")
@@ -851,23 +702,12 @@ Good next features
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=6, padx=(0, 10))
         ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", pady=6)
 
-        if kind == "file":
-            ttk.Button(parent, text="Select file", command=lambda: self._browse_file(var)).grid(
-                row=row, column=2, sticky="ew", padx=(8, 0), pady=6
-            )
-        elif kind == "folder":
+        if kind == "folder":
             ttk.Button(parent, text="Select folder", command=lambda: self._browse_folder(var)).grid(
                 row=row, column=2, sticky="ew", padx=(8, 0), pady=6
             )
         else:
             raise ValueError(f"Unknown path row kind: {kind}")
-
-    def _browse_file(self, var: tk.StringVar) -> None:
-        selected = filedialog.askopenfilename(parent=self)
-        if selected:
-            var.set(selected)
-            self.lift()
-            self.focus_force()
 
     def _browse_folder(self, var: tk.StringVar) -> None:
         selected = filedialog.askdirectory(parent=self, mustexist=True)
@@ -882,9 +722,6 @@ Good next features
             raise ValueError("Select at least one beatmapset category.")
 
         output_folder = Path(self.output_folder_var.get()).expanduser()
-        cm_cli = Path(self.cm_cli_var.get()).expanduser() if self.cm_cli_var.get().strip() else None
-        osu_location = Path(self.osu_location_var.get()).expanduser() if self.osu_location_var.get().strip() else None
-
         generate_osdb = force_generate and self.generate_osdb_var.get()
 
         client_id = self.client_id_var.get().strip()
@@ -918,8 +755,6 @@ Good next features
             ar_max=round(ar_max, 2),
             output_folder=output_folder,
             collection_name=collection_name,
-            cm_cli_path=cm_cli,
-            osu_location=osu_location,
             generate_osdb=generate_osdb,
         )
 
@@ -942,7 +777,7 @@ Good next features
     def _run_job(self, options: FetchOptions) -> None:
         try:
             self.log("Starting job...")
-            user, beatmap_records, stats = collect_beatmap_ids(options, self.log)
+            user, beatmap_records, stats = collect_beatmaps(options, self.log)
 
             if not beatmap_records:
                 self.log("No beatmaps found with these filters.")
@@ -961,8 +796,8 @@ Good next features
 
             output_path = None
             if options.generate_osdb:
-                output_path = write_api_osdb(options.output_folder, options.collection_name, records)
-                self.log(f"Created API-filled .osdb: {output_path}")
+                output_path = write_osdb(options.output_folder, options.collection_name, records)
+                self.log(f"Created .osdb: {output_path}")
             else:
                 self.log("Preview complete. .osdb generation skipped.")
 
@@ -1016,8 +851,6 @@ Good next features
             "mapper": self.mapper_var.get(),
             "collection_name": self.collection_name_var.get(),
             "output_folder": self.output_folder_var.get(),
-            "cm_cli": self.cm_cli_var.get(),
-            "osu_location": self.osu_location_var.get(),
             "ruleset": self.ruleset_var.get(),
             "star_min": self.star_min_var.get(),
             "star_max": self.star_max_var.get(),
@@ -1046,8 +879,6 @@ Good next features
         self.mapper_var.set(data.get("mapper", self.mapper_var.get()))
         self.collection_name_var.set(data.get("collection_name", self.collection_name_var.get()))
         self.output_folder_var.set(data.get("output_folder", self.output_folder_var.get()))
-        self.cm_cli_var.set(data.get("cm_cli", ""))
-        self.osu_location_var.set(data.get("osu_location", ""))
         self.ruleset_var.set(data.get("ruleset", "All modes"))
         self.star_min_var.set(float(data.get("star_min", 0.0)))
         self.star_max_var.set(float(data.get("star_max", 15.0)))
