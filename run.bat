@@ -1,0 +1,1 @@
+uv run --script .\mapper_osdb_gui.py -nogui
